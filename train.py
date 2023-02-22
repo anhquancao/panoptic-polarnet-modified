@@ -78,9 +78,12 @@ def main(args):
     if args['model']['polar']:
         train_dataset=spherical_dataset(train_pt_dataset, args['dataset'], grid_size = grid_size, ignore_label = 0, use_aug = True)
         val_dataset=spherical_dataset(val_pt_dataset, args['dataset'], grid_size = grid_size, ignore_label = 0)
+        # train_dataset[0] # TODO: remove this line
+
     else:
         train_dataset=voxel_dataset(train_pt_dataset, args['dataset'], grid_size = grid_size, ignore_label = 0,use_aug = True)
         val_dataset=voxel_dataset(val_pt_dataset, args['dataset'], grid_size = grid_size, ignore_label = 0)
+   
     train_dataset_loader = torch.utils.data.DataLoader(dataset = train_dataset,
                                                     batch_size = train_batch_size,
                                                     collate_fn = collate_fn_BEV,
@@ -221,7 +224,7 @@ def main(args):
 if __name__ == '__main__':
     # Training settings
     parser = argparse.ArgumentParser(description='')
-    parser.add_argument('-d', '--data_dir', default='data')
+    parser.add_argument('-d', '--data_dir', default='/gpfswork/rech/kvd/uyl37fq/data/semantic_kitti/dataset')
     parser.add_argument('-p', '--model_save_path', default='./Panoptic_SemKITTI.pt')
     parser.add_argument('-c', '--configs', default='configs/SemanticKITTI_model/Panoptic-PolarNet.yaml')
     parser.add_argument('--pretrained_model', default='empty')

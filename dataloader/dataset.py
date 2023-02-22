@@ -26,6 +26,8 @@ class SemKITTI(data.Dataset):
         thing_class = semkittiyaml['thing_class']
         self.thing_list = [cl for cl, ignored in thing_class.items() if ignored]
         self.imageset = imageset
+
+        self.our_thing_classes = [1, 2, 3, 4, 5, 6, 7, 8, 18, 19] # semantic kitti doesn't consider 18 and 19 as thing classes
         if imageset == 'train':
             split = semkittiyaml['split']['train']
         elif imageset == 'val':
@@ -35,10 +37,32 @@ class SemKITTI(data.Dataset):
         else:
             raise Exception('Split must be train/val/test')
         
+
+        self.ssc_root = "/gpfsscratch/rech/kvd/uyl37fq/uncertainty/js3cnetcompletion/submit_trainval2023_02_20/sequences"
+        preprocess_root = "/gpfsscratch/rech/kvd/uyl37fq/monoscene_preprocess/kitti"
+        self.instance_label_root = os.path.join(preprocess_root, "instance_labels")
         self.im_idx = []
+        self.data_path = data_path
+        self.scans = []
         for i_folder in split:
-            self.im_idx += absoluteFilePaths('/'.join([data_path,str(i_folder).zfill(2),'velodyne']))
-        self.im_idx.sort()
+            # self.im_idx += absoluteFilePaths('/'.join([data_path,str(i_folder).zfill(2),'velodyne']))
+            # import pdb;pdb.set_trace()
+            # ssc_path = os.path.join(self.ssc_root, str(i_folder).zfill(2), "predictions")
+            # self.im_idx += 
+            instance_label_folder = os.path.join(self.instance_label_root, str(i_folder).zfill(2))
+            paths = absoluteFilePaths(instance_label_folder)
+
+            for path in paths:
+                frame_id = os.path.basename(path)[:-8]
+                self.scans.append({
+                    # "ssc_path": path,
+                    "instance_path": path,
+                    "seq": i_folder,
+                    "frame_id": frame_id,
+                    "velodyne_path": os.path.join(data_path, str(i_folder).zfill(2), "velodyne", frame_id + ".bin"),
+                    "label_path": os.path.join(data_path, str(i_folder).zfill(2), "labels", frame_id + ".label"),
+                })
+        # self.im_idx.sort()
 
         # get class distribution weight 
         epsilon_w = 0.001
@@ -52,22 +76,70 @@ class SemKITTI(data.Dataset):
          
     def __len__(self):
         'Denotes the total number of samples'
-        return len(self.im_idx)
+        # return len(self.im_idx)
+        return len(self.scans)
     
     def __getitem__(self, index):
-        raw_data = np.fromfile(self.im_idx[index], dtype=np.float32).reshape((-1, 4))
+        scan = self.scans[index]
+        velodyne_path = scan["velodyne_path"]
+        instance_path = scan["instance_path"]
+        raw_data = np.fromfile(velodyne_path, dtype=np.float32).reshape((-1, 4))
         if self.imageset == 'test':
             sem_data = np.expand_dims(np.zeros_like(raw_data[:,0],dtype=int),axis=1)
             inst_data = np.expand_dims(np.zeros_like(raw_data[:,0],dtype=np.uint32),axis=1)
         else:
-            annotated_data = np.fromfile(self.im_idx[index].replace('velodyne','labels')[:-3]+'label', dtype=np.uint32).reshape((-1,1))
+            label_path = scan["label_path"]
+            annotated_data = np.fromfile(label_path, dtype=np.uint32).reshape((-1,1))
+            
             sem_data = annotated_data & 0xFFFF #delete high 16 digits binary
             sem_data = np.vectorize(self.learning_map.__getitem__)(sem_data)
             inst_data = annotated_data
+
+            instance_path = self.scans[index]["instance_path"]
+            with open(instance_path, 'rb') as handle:
+                data = pickle.load(handle)
+                semantic_label = data['semantic_labels']
+                inst_label = data['instance_labels']
+                inst_label[inst_label != 0] += 20
+                # inst_label = inst_label + 20 + semantic_label
+                inst_label[inst_label == 0] = semantic_label[inst_label == 0]
+
+                
+            complete_xyz, complete_sem_labels = self.create_pointcloud_from_voxels(semantic_label)
+            instance_xyz, inst_label = self.create_pointcloud_from_voxels(inst_label)
+           
+
         data_tuple = (raw_data[:,:3], sem_data.astype(np.uint8),inst_data)
         if self.return_ref:
             data_tuple += (raw_data[:,3],)
-        return data_tuple
+        ret = {
+            'xyz': raw_data[:,:3],
+            'labels': sem_data.astype(np.uint8),
+            "insts": inst_data,
+            "feat": raw_data[:,3],
+
+            "complete_xyz": complete_xyz.astype(np.float32),
+            "complete_sem_labels": complete_sem_labels.astype(np.uint8),
+            'instance_xyz': instance_xyz,
+            'inst_label': inst_label,
+            'feat': complete_sem_labels
+        }
+        # return data_tuple
+        return ret
+
+
+    def create_pointcloud_from_voxels(self, voxels, 
+        vox_size=0.2,
+        vox_origin=np.array([0, -25.6, -2.0])):
+        temp = np.copy(voxels)
+        temp[temp == 255] = 0
+        
+        xs, ys, zs = np.nonzero(temp)
+        coords = np.concatenate([xs.reshape(-1, 1), ys.reshape(-1, 1), zs.reshape(-1, 1)], axis=1)
+        points = coords.astype(np.float32) * vox_size + vox_origin
+        label = voxels[xs, ys, zs]
+        return points, label
+
 
     def save_instance(self, out_dir, min_points = 10):
         'instance data preparation'
@@ -248,6 +320,7 @@ class voxel_dataset(data.Dataset):
 def cart2polar(input_xyz):
     rho = np.sqrt(input_xyz[:,0]**2 + input_xyz[:,1]**2)
     phi = np.arctan2(input_xyz[:,1],input_xyz[:,0])
+    
     return np.stack((rho,phi,input_xyz[:,2]),axis=1)
 
 def polar2cat(input_xyz_polar):
@@ -256,7 +329,8 @@ def polar2cat(input_xyz_polar):
     return np.stack((x,y,input_xyz_polar[2]),axis=0)
 
 class spherical_dataset(data.Dataset):
-  def __init__(self, in_dataset, args, grid_size, ignore_label = 0, return_test = False, use_aug = False, fixed_volume_space= True, max_volume_space = [50,np.pi,1.5], min_volume_space = [3,-np.pi,-3]):
+  def __init__(self, in_dataset, args, grid_size, ignore_label = 0, return_test = False, use_aug = False, fixed_volume_space= True, 
+    max_volume_space = [50,np.pi,1.5], min_volume_space = [3,-np.pi,-3]):
         'Initialization'
         self.point_cloud_dataset = in_dataset
         self.grid_size = np.asarray(grid_size)
@@ -271,7 +345,8 @@ class spherical_dataset(data.Dataset):
 
         self.panoptic_proc = PanopticLabelGenerator(self.grid_size,sigma=args['gt_generator']['sigma'],polar=True)
         if self.instance_aug:
-            self.inst_aug = instance_augmentation(self.point_cloud_dataset.instance_pkl_path+'/instance_path.pkl',self.point_cloud_dataset.thing_list,self.point_cloud_dataset.CLS_LOSS_WEIGHT,\
+            self.inst_aug = instance_augmentation(self.point_cloud_dataset.instance_pkl_path+'/instance_path.pkl',
+                                                self.point_cloud_dataset.thing_list,self.point_cloud_dataset.CLS_LOSS_WEIGHT,\
                                                 random_flip=args['inst_aug_type']['inst_global_aug'],random_add=args['inst_aug_type']['inst_os'],\
                                                 random_rotate=args['inst_aug_type']['inst_global_aug'],local_transformation=args['inst_aug_type']['inst_loc_aug'])
 
@@ -282,11 +357,25 @@ class spherical_dataset(data.Dataset):
   def __getitem__(self, index):
         'Generates one sample of data'
         data = self.point_cloud_dataset[index]
-        if len(data) == 3:
-            xyz,labels,insts = data
-        elif len(data) == 4:
-            xyz,labels,insts,feat = data
-            if len(feat.shape) == 1: feat = feat[..., np.newaxis]
+        # xyz = data['xyz']
+        # labels = data['labels']
+        # insts = data['insts']
+        feat = data['feat']
+        complete_xyz = data['complete_xyz']
+        complete_sem_labels = data['complete_sem_labels']
+        instance_xyz = data['instance_xyz']
+        inst_label = data['inst_label']
+
+        
+        xyz = complete_xyz
+        labels = complete_sem_labels
+        insts = inst_label
+
+        # if len(data) == 3:
+        #     xyz,labels,insts = data
+        # elif len(data) == 4:
+        #     xyz,labels,insts,feat = data
+        if len(feat.shape) == 1: feat = feat[..., np.newaxis]
         else: raise Exception('Return invalid data tuple')
         if len(labels.shape) == 1: labels = labels[..., np.newaxis]
         if len(insts.shape) == 1: insts = insts[..., np.newaxis]
@@ -308,12 +397,14 @@ class spherical_dataset(data.Dataset):
             elif flip_type==3:
                 xyz[:,:2] = -xyz[:,:2]
 
+        
         # random instance augmentation
-        if self.instance_aug:
-            xyz,labels,insts,feat = self.inst_aug.instance_aug(xyz,labels.squeeze(),insts.squeeze(),feat)
+        # if self.instance_aug:
+        #     xyz,labels,insts,feat = self.inst_aug.instance_aug(xyz,labels.squeeze(),insts.squeeze(),feat)
         
         # convert coordinate into polar coordinates
         xyz_pol = cart2polar(xyz)
+        
         
         max_bound_r = np.percentile(xyz_pol[:,0],100,axis = 0)
         min_bound_r = np.percentile(xyz_pol[:,0],0,axis = 0)
@@ -325,6 +416,7 @@ class spherical_dataset(data.Dataset):
             max_bound = np.asarray(self.max_volume_space)
             min_bound = np.asarray(self.min_volume_space)
 
+        
         # get grid index
         crop_range = max_bound - min_bound
         cur_grid_size = self.grid_size
@@ -332,7 +424,8 @@ class spherical_dataset(data.Dataset):
 
         if (intervals==0).any(): print("Zero interval!")
         grid_ind = (np.floor((np.clip(xyz_pol,min_bound,max_bound)-min_bound)/intervals)).astype(np.int)
-
+        
+        
         current_grid = grid_ind[:np.size(labels)]
 
         # process voxel position
@@ -341,20 +434,24 @@ class spherical_dataset(data.Dataset):
         dim_array[0] = -1 
         voxel_position = np.indices(self.grid_size)*intervals.reshape(dim_array) + min_bound.reshape(dim_array)
         # voxel_position = polar2cat(voxel_position)
+
         
         # process labels
         processed_label = np.ones(self.grid_size,dtype = np.uint8)*self.ignore_label
         label_voxel_pair = np.concatenate([current_grid,labels],axis = 1)
         label_voxel_pair = label_voxel_pair[np.lexsort((current_grid[:,0],current_grid[:,1],current_grid[:,2])),:]
+        
         processed_label = nb_process_label(np.copy(processed_label),label_voxel_pair)
         # data_tuple = (voxel_position,processed_label)
 
         # get thing points mask
         mask = np.zeros_like(labels,dtype=bool)
-        for label in self.point_cloud_dataset.thing_list:
+        # for label in self.point_cloud_dataset.thing_list:
+        for label in self.point_cloud_dataset.our_thing_classes:
             mask[labels == label] = True
         
         inst_label = insts[mask].squeeze()
+
         unique_label = np.unique(inst_label)
         unique_label_dict = {label:idx+1 for idx , label in enumerate(unique_label)}
         if inst_label.size > 1:            
@@ -367,7 +464,8 @@ class spherical_dataset(data.Dataset):
             processed_inst = nb_process_inst(np.copy(processed_inst),inst_voxel_pair)
         else:
             processed_inst = None
-
+        
+        
         center,center_points,offset = self.panoptic_proc(insts[mask],xyz[:np.size(labels)][mask[:,0]],processed_inst,voxel_position[:2,:,:,0],unique_label_dict,min_bound,intervals)
 
         # prepare visiblity feature
@@ -390,11 +488,12 @@ class spherical_dataset(data.Dataset):
         return_xyz = xyz_pol - voxel_centers
         return_xyz = np.concatenate((return_xyz,xyz_pol,xyz[:,:2]),axis = 1)
 
-        if len(data) == 3:
-            return_fea = return_xyz
-        elif len(data) == 4:
-            return_fea = np.concatenate((return_xyz,feat),axis = 1)
         
+        # if len(data) == 3:
+        #     return_fea = return_xyz
+        # elif len(data) == 4:
+            # return_fea = np.concatenate((return_xyz,feat),axis = 1)
+        return_fea = np.concatenate((return_xyz,feat),axis = 1)
         if self.return_test:
             data_tuple += (grid_ind,labels,insts,return_fea,index)
         else:

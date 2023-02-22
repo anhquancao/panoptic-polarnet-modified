@@ -65,7 +65,7 @@ This code is tested on Ubuntu 16.04 with Python 3.8, CUDA 10.2 and Pytorch 1.7.0
 
 5, Instance preprocessing:
 ```shell
-python instance_preprocess.py -d </your data path> -o </preprocessed file output path>
+python instance_preprocess.py -d /gpfswork/rech/kvd/uyl37fq/data/semantic_kitti/dataset -o /gpfsscratch/rech/kvd/uyl37fq/uncertainty/polarnet/instance_preprocess
 ``` 
 
 ## Training
